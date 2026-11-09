@@ -15,17 +15,19 @@ date_default_timezone_set('America/Mexico_City');
 $nombre_usuario = isset($_POST['nombre']) ? trim($_POST['nombre']) : $_SESSION['usuario_nombre'];
 $fecha_reporte = isset($_POST['fecha']) ? trim($_POST['fecha']) : date('d/m/Y');
 $contenido_texto = isset($_POST['contenido']) ? trim($_POST['contenido']) : '';
-$insumo_seleccionado_nombre = isset($_POST['insumo_nombre']) ? trim($_POST['insumo_nombre']) : '';
-$cantidad_solicitada = isset($_POST['cantidad_solicitada']) ? intval($_POST['cantidad_solicitada']) : 0;
+
+// Arreglos recibidos del formulario para múltiples insumos
+$insumos_nombres = $_POST['insumo_nombre'] ?? [];
+$cantidades_solicitadas = $_POST['cantidad_solicitada'] ?? [];
 
 // Tomar directamente el puesto guardado al iniciar sesión
 $puesto_usuario = $_SESSION['usuario_puesto'] ?? ($_SESSION['usuario_rol'] ?? 'Cajero'); 
 
 $generando = isset($_POST['generar']);
-$mensaje_solicitud_pdf = "";
-$movimiento_actual = null; // Guardará únicamente la solicitud del reporte en curso
+$mensajes_solicitud_pdf = [];
+$movimientos_actuales = []; // Array con los insumos descontados en este reporte
 
-// Obtener la lista completa de insumos de la BD para el datalist
+// Obtener la lista completa de insumos de la BD para los datalists
 $res_todos_insumos = $conexion->query("SELECT id, nombre, cantidad FROM insumos ORDER BY nombre ASC");
 $insumos_lista = [];
 if ($res_todos_insumos && $res_todos_insumos->num_rows > 0) {
@@ -34,7 +36,7 @@ if ($res_todos_insumos && $res_todos_insumos->num_rows > 0) {
     }
 }
 
-// Guardar el reporte, registrar la solicitud y descontar de inventario si aplica
+// Guardar el reporte, registrar las solicitudes y descontar del inventario
 if ($generando) {
     if (!empty($contenido_texto)) {
         // 1. Guardar el reporte de texto en la BD
@@ -44,52 +46,58 @@ if ($generando) {
         $stmt->close();
     }
 
-    // 2. Si se escribió/seleccionó un insumo y una cantidad válida
-    if (!empty($insumo_seleccionado_nombre) && $cantidad_solicitada > 0) {
-        // Buscar el insumo en la base de datos por su nombre exacto
-        $stmt_ins = $conexion->prepare("SELECT id, nombre, cantidad FROM insumos WHERE nombre = ?");
-        $stmt_ins->bind_param("s", $insumo_seleccionado_nombre);
-        $stmt_ins->execute();
-        $res_ins = $stmt_ins->get_result();
+    // 2. Procesar la lista de múltiples insumos
+    if (is_array($insumos_nombres) && count($insumos_nombres) > 0) {
+        $fecha_actual_full = date('Y-m-d H:i:s');
+        $tipo_mov = "Solicitud / Retiro";
 
-        if ($res_ins && $res_ins->num_rows > 0) {
-            $datos_insumo = $res_ins->fetch_assoc();
-            $insumo_id = intval($datos_insumo['id']);
-            $nombre_insumo = $datos_insumo['nombre'];
-            $stock_actual = intval($datos_insumo['cantidad']);
+        for ($idx = 0; $idx < count($insumos_nombres); $idx++) {
+            $nombre_ins_item = trim($insumos_nombres[$idx]);
+            $cant_req_item = intval($cantidades_solicitadas[$idx] ?? 0);
 
-            $cantidad_descontar = min($cantidad_solicitada, $stock_actual);
+            if (!empty($nombre_ins_item) && $cant_req_item > 0) {
+                // Buscar el insumo por nombre exacto
+                $stmt_ins = $conexion->prepare("SELECT id, nombre, cantidad FROM insumos WHERE nombre = ?");
+                $stmt_ins->bind_param("s", $nombre_ins_item);
+                $stmt_ins->execute();
+                $res_ins = $stmt_ins->get_result();
 
-            if ($cantidad_descontar > 0) {
-                // Descontar del inventario
-                $nuevo_stock = $stock_actual - $cantidad_descontar;
-                $stmt_upd = $conexion->prepare("UPDATE insumos SET cantidad = ? WHERE id = ?");
-                $stmt_upd->bind_param("ii", $nuevo_stock, $insumo_id);
-                $stmt_upd->execute();
-                $stmt_upd->close();
+                if ($res_ins && $res_ins->num_rows > 0) {
+                    $datos_insumo = $res_ins->fetch_assoc();
+                    $insumo_id = intval($datos_insumo['id']);
+                    $nombre_real = $datos_insumo['nombre'];
+                    $stock_actual = intval($datos_insumo['cantidad']);
 
-                // Registrar en movimientos_inventario
-                $tipo_mov = "Solicitud / Retiro";
-                $fecha_actual_full = date('Y-m-d H:i:s');
-                $stmt_mov = $conexion->prepare("INSERT INTO movimientos_inventario (usuario, puesto, insumo, cantidad, tipo_movimiento, fecha) VALUES (?, ?, ?, ?, ?, ?)");
-                $stmt_mov->bind_param("sssiss", $nombre_usuario, $puesto_usuario, $nombre_insumo, $cantidad_descontar, $tipo_mov, $fecha_actual_full);
-                $stmt_mov->execute();
-                $stmt_mov->close();
+                    $cantidad_descontar = min($cant_req_item, $stock_actual);
 
-                $mensaje_solicitud_pdf = "Solicitud realizada: " . $nombre_insumo . " (Cantidad: " . $cantidad_descontar . " unidades)";
-                
-                // Estructura de evidencia exclusiva para este reporte
-                $movimiento_actual = [
-                    'fecha' => $fecha_actual_full,
-                    'usuario' => $nombre_usuario,
-                    'puesto' => $puesto_usuario,
-                    'insumo' => $nombre_insumo,
-                    'cantidad' => $cantidad_descontar,
-                    'tipo_movimiento' => $tipo_mov
-                ];
+                    if ($cantidad_descontar > 0) {
+                        // Descontar stock
+                        $nuevo_stock = $stock_actual - $cantidad_descontar;
+                        $stmt_upd = $conexion->prepare("UPDATE insumos SET cantidad = ? WHERE id = ?");
+                        $stmt_upd->bind_param("ii", $nuevo_stock, $insumo_id);
+                        $stmt_upd->execute();
+                        $stmt_upd->close();
+
+                        // Auditoría en movimientos_inventario
+                        $stmt_mov = $conexion->prepare("INSERT INTO movimientos_inventario (usuario, puesto, insumo, cantidad, tipo_movimiento, fecha) VALUES (?, ?, ?, ?, ?, ?)");
+                        $stmt_mov->bind_param("sssiss", $nombre_usuario, $puesto_usuario, $nombre_real, $cantidad_descontar, $tipo_mov, $fecha_actual_full);
+                        $stmt_mov->execute();
+                        $stmt_mov->close();
+
+                        $mensajes_solicitud_pdf[] = "• " . $nombre_real . ": " . $cantidad_descontar . " unidades";
+
+                        $movimientos_actuales[] = [
+                            'fecha' => $fecha_actual_full,
+                            'usuario' => $nombre_usuario,
+                            'puesto' => $puesto_usuario,
+                            'insumo' => $nombre_real,
+                            'cantidad' => $cantidad_descontar
+                        ];
+                    }
+                }
+                $stmt_ins->close();
             }
         }
-        $stmt_ins->close();
     }
 }
 ?>
@@ -121,10 +129,9 @@ if ($generando) {
             padding: 20px;
         }
 
-        /* Ventana del Formulario */
         .report-window {
             width: 100%;
-            max-width: 800px;
+            max-width: 850px;
             background-color: #4a7584;
             border-radius: 12px;
             box-shadow: 0 10px 30px rgba(0,0,0,0.3);
@@ -199,7 +206,74 @@ if ($generando) {
             box-shadow: inset 0 2px 4px rgba(0,0,0,0.1);
         }
 
+        /* Bloque Dinámico de Insumos */
+        .receta-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .receta-title {
+            font-size: 18px;
+            font-weight: bold;
+            color: #ffffff;
+        }
+
+        .btn-add-item {
+            background-color: #28a745;
+            color: #fff;
+            border: none;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            transition: background 0.2s;
+        }
+
+        .btn-add-item:hover {
+            background-color: #218838;
+        }
+
+        .insumo-row-item {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .insumo-row-item .form-input {
+            margin-bottom: 0;
+        }
+
+        .input-cant {
+            max-width: 120px;
+        }
+
+        .btn-remove-item {
+            background-color: #dc3545;
+            color: #fff;
+            border: none;
+            width: 35px;
+            height: 35px;
+            border-radius: 50%;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+        }
+
+        .btn-remove-item:hover {
+            background-color: #bd2130;
+        }
+
         .textarea-container {
+            margin-top: 15px;
             margin-bottom: 10px;
         }
 
@@ -247,7 +321,7 @@ if ($generando) {
             transform: translateY(-2px);
         }
 
-        /* --- TABLA DE EVIDENCIAS EN PDF --- */
+        /* PDF Styles */
         .evidence-table {
             width: 100%;
             border-collapse: collapse;
@@ -268,10 +342,8 @@ if ($generando) {
             color: #333;
         }
 
-        .badge-add { color: #28a745; font-weight: bold; }
         .badge-remove { color: #dc3545; font-weight: bold; }
 
-        /* --- PLANTILLA HOJA MEMBRETADA PARA CONVERSIÓN PDF --- */
         #pdfTemplate { display: none; }
 
         .pdf-container {
@@ -326,7 +398,14 @@ if ($generando) {
 </head>
 <body>
 
-    <!-- Ventana del Formulario (Interfaz visual) -->
+    <datalist id="listaInsumos">
+        <?php foreach ($insumos_lista as $ins): ?>
+            <option value="<?php echo htmlspecialchars($ins['nombre']); ?>">
+                <?php echo "Stock disponible: " . intval($ins['cantidad']); ?>
+            </option>
+        <?php endforeach; ?>
+    </datalist>
+
     <div class="report-window">
         <div class="report-header">
             <h1 class="report-title">Reportes</h1>
@@ -347,28 +426,22 @@ if ($generando) {
                     <input type="text" id="fecha" name="fecha" class="form-input" value="<?php echo htmlspecialchars($fecha_reporte); ?>" required>
                 </div>
 
-                <!-- Campo único con autocompletado y desplegable integrado (Datalist) -->
-                <div class="form-group">
-                    <label for="insumo_nombre">Insumo</label>
-                    <input type="text" id="insumo_nombre" name="insumo_nombre" class="form-input" list="listaInsumos" placeholder="🔍 Escribe o selecciona un insumo...">
-                    <datalist id="listaInsumos">
-                        <?php foreach ($insumos_lista as $ins): ?>
-                            <option value="<?php echo htmlspecialchars($ins['nombre']); ?>">
-                                <?php echo "Stock disponible: " . intval($ins['cantidad']); ?>
-                            </option>
-                        <?php endforeach; ?>
-                    </datalist>
+                <!-- Lista dinámica de insumos para la receta -->
+                <div class="receta-header">
+                    <span class="receta-title">Seleccion de insumos solicitados</span>
+                    <button type="button" class="btn-add-item" onclick="agregarFilaInsumo()">+ Añadir Insumo</button>
                 </div>
 
-                <!-- Cantidad del Insumo Solicitado -->
-                <div class="form-group">
-                    <label for="cantidad_solicitada">Cantidad</label>
-                    <input type="number" id="cantidad_solicitada" name="cantidad_solicitada" class="form-input" min="0" value="0" placeholder="0">
+                <div id="contenedorInsumos">
+                    <div class="insumo-row-item">
+                        <input type="text" name="insumo_nombre[]" class="form-input" list="listaInsumos" placeholder="🔍 Buscar o seleccionar insumo...">
+                        <input type="number" name="cantidad_solicitada[]" class="form-input input-cant" min="0" value="0" placeholder="Cant.">
+                        <button type="button" class="btn-remove-item" onclick="eliminarFilaInsumo(this)" title="Quitar este insumo">✕</button>
+                    </div>
                 </div>
 
-                <!-- Campo de texto con límite de 3000 caracteres -->
                 <div class="textarea-container">
-                    <textarea name="contenido" id="contenido" class="report-textarea" maxlength="3000" placeholder="Escribe los detalles del reporte aquí..." oninput="actualizarContador()" required><?php echo htmlspecialchars($contenido_texto); ?></textarea>
+                    <textarea name="contenido" id="contenido" class="report-textarea" maxlength="3000" placeholder="Escribe los detalles del reporte o receta aquí..." oninput="actualizarContador()" required><?php echo htmlspecialchars($contenido_texto); ?></textarea>
                 </div>
                 
                 <div class="char-counter">
@@ -382,14 +455,12 @@ if ($generando) {
         </div>
     </div>
 
-    <!-- Hoja Membretada para Renderizado y Descarga de PDF Directo -->
+    <!-- Hoja Membretada para PDF -->
     <div id="pdfTemplate">
         <div class="pdf-container" id="pdfContent">
-            <!-- Marca de agua -->
             <img src="Azul.png" alt="Marca de agua" class="watermark-pdf">
 
             <div class="sheet-inner-pdf">
-                <!-- Encabezado con Logo -->
                 <div class="sheet-header-pdf">
                     <div>
                         <img src="Logo color.png" alt="Atmósfera Dulce" class="logo-pdf">
@@ -399,7 +470,6 @@ if ($generando) {
                     </div>
                 </div>
 
-                <!-- Contenido Principal -->
                 <div class="sheet-body-pdf">
                     <div style="margin-bottom: 20px; font-size: 15px; color: #222;">
                         <strong>Emitido por:</strong> <span id="lblNombre"></span> (<span id="lblPuesto"></span>)
@@ -407,12 +477,11 @@ if ($generando) {
                     
                     <h3 style="margin-bottom: 10px; color: #444; border-bottom: 1px solid #ccc; padding-bottom: 5px;">Reporte de Operaciones</h3>
                     
-                    <div id="lblSolicitudEspecifica" style="font-size: 15px; font-weight: bold; color: #dc3545; margin-bottom: 15px; display: none;"></div>
+                    <div id="lblSolicitudEspecifica" style="font-size: 14px; font-weight: bold; color: #dc3545; margin-bottom: 15px; display: none;"></div>
 
                     <div id="lblContenido" style="font-size: 15px; line-height: 1.6; color: #111; white-space: pre-wrap; margin-top: 10px;"></div>
 
-                    <!-- Sección de Evidencias Exclusiva del Reporte Actual -->
-                    <h4 style="margin-top: 25px; margin-bottom: 10px; color: #333; border-bottom: 1px solid #ddd; padding-bottom: 5px;">Evidencia de Movimiento de Insumo (Solicitud Actual)</h4>
+                    <h4 style="margin-top: 25px; margin-bottom: 10px; color: #333; border-bottom: 1px solid #ddd; padding-bottom: 5px;">Evidencia de Movimientos de Insumos (Receta Solicitada)</h4>
                     
                     <table class="evidence-table">
                         <thead>
@@ -426,15 +495,17 @@ if ($generando) {
                             </tr>
                         </thead>
                         <tbody>
-                            <?php if (!empty($movimiento_actual)): ?>
-                                <tr>
-                                    <td><?php echo htmlspecialchars($movimiento_actual['fecha']); ?></td>
-                                    <td><?php echo htmlspecialchars($movimiento_actual['usuario']); ?></td>
-                                    <td><?php echo htmlspecialchars($movimiento_actual['puesto']); ?></td>
-                                    <td><?php echo htmlspecialchars($movimiento_actual['insumo']); ?></td>
-                                    <td><?php echo htmlspecialchars($movimiento_actual['cantidad']); ?></td>
-                                    <td><span class="badge-remove">- Solicitado</span></td>
-                                </tr>
+                            <?php if (!empty($movimientos_actuales)): ?>
+                                <?php foreach ($movimientos_actuales as $mov_item): ?>
+                                    <tr>
+                                        <td><?php echo htmlspecialchars($mov_item['fecha']); ?></td>
+                                        <td><?php echo htmlspecialchars($mov_item['usuario']); ?></td>
+                                        <td><?php echo htmlspecialchars($mov_item['puesto']); ?></td>
+                                        <td><?php echo htmlspecialchars($mov_item['insumo']); ?></td>
+                                        <td><?php echo htmlspecialchars($mov_item['cantidad']); ?></td>
+                                        <td><span class="badge-remove">- Solicitado</span></td>
+                                    </tr>
+                                <?php endforeach; ?>
                             <?php else: ?>
                                 <tr>
                                     <td colspan="6" style="text-align: center; color: #777;">No se incluyeron solicitudes de insumos en este reporte.</td>
@@ -444,7 +515,6 @@ if ($generando) {
                     </table>
                 </div>
 
-                <!-- Franja Rosa inferior -->
                 <div>
                     <img src="Rosa.png" alt="Pie de página" class="footer-pdf-img">
                 </div>
@@ -453,11 +523,34 @@ if ($generando) {
     </div>
 
     <script>
-        // Contador de caracteres
         function actualizarContador() {
             const textarea = document.getElementById('contenido');
             const counter = document.getElementById('charCount');
             counter.innerText = textarea.value.length;
+        }
+
+        function agregarFilaInsumo() {
+            const contenedor = document.getElementById('contenedorInsumos');
+            const div = document.createElement('div');
+            div.className = 'insumo-row-item';
+            div.innerHTML = `
+                <input type="text" name="insumo_nombre[]" class="form-input" list="listaInsumos" placeholder="🔍 Buscar o seleccionar insumo...">
+                <input type="number" name="cantidad_solicitada[]" class="form-input input-cant" min="0" value="0" placeholder="Cant.">
+                <button type="button" class="btn-remove-item" onclick="eliminarFilaInsumo(this)" title="Quitar este insumo">✕</button>
+            `;
+            contenedor.appendChild(div);
+        }
+
+        function eliminarFilaInsumo(btn) {
+            const contenedor = document.getElementById('contenedorInsumos');
+            if (contenedor.children.length > 1) {
+                btn.parentElement.remove();
+            } else {
+                // Si es la única fila, limpiar sus campos
+                const row = btn.parentElement;
+                row.querySelector('input[type="text"]').value = '';
+                row.querySelector('input[type="number"]').value = '0';
+            }
         }
 
         actualizarContador();
@@ -470,9 +563,9 @@ if ($generando) {
         document.getElementById('lblPuesto').innerText = "<?php echo addslashes($puesto_usuario); ?>";
         document.getElementById('lblContenido').innerText = `<?php echo addslashes($contenido_texto); ?>`;
 
-        <?php if (!empty($mensaje_solicitud_pdf)): ?>
+        <?php if (!empty($mensajes_solicitud_pdf)): ?>
             const lblSol = document.getElementById('lblSolicitudEspecifica');
-            lblSol.innerText = "<?php echo addslashes($mensaje_solicitud_pdf); ?>";
+            lblSol.innerHTML = "<strong>Insumos descontados para esta receta:</strong><br>" + `<?php echo implode('<br>', array_map('addslashes', $mensajes_solicitud_pdf)); ?>`;
             lblSol.style.display = "block";
         <?php endif; ?>
 
